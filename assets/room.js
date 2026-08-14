@@ -2,17 +2,23 @@
 
 "use strict";
 
+// Matches the signalling server's cap. The grid always shows this many tiles.
+const MAX_PARTICIPANTS = 4;
+
+// Longest chat message that can be sent, enforced on the input and on send.
+const MAX_CHAT_LENGTH = 320;
+
 // eslint-disable-next-line no-unused-vars
 const App = Vue.createApp({
 	data() {
-		const channelId = window.location.pathname.substr(1);
+		const roomId = window.location.pathname.substr(1);
 		const searchParams = new URLSearchParams(window.location.search);
 
 		const name = searchParams.get("name");
 		const chatEnabled = searchParams.get("chat") !== "false";
 
 		return {
-			channelId,
+			roomId,
 			peerId: "",
 			userAgent: "",
 			audioDevices: [],
@@ -31,10 +37,9 @@ const App = Vue.createApp({
 			chatEnabled,
 			chats: [],
 			chatMessage: "",
+			maxChatLength: MAX_CHAT_LENGTH,
 			showChat: false,
 			showExtraControls: false,
-			showAudioDevices: false,
-			showVideoDevices: false,
 			toast: [{ type: "", message: "" }],
 		};
 	},
@@ -49,16 +54,10 @@ const App = Vue.createApp({
 		screenShareSupported() {
 			return navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia;
 		},
-		videoLayoutClass() {
+		emptySlots() {
 			const totalParticipants = this.peersArray.length + 1; // +1 for self
 
-			if (totalParticipants === 1) return "layout-1";
-			if (totalParticipants === 2) return "layout-2";
-			if (totalParticipants === 3) return "layout-3";
-			if (totalParticipants === 4) return "layout-4";
-			if (totalParticipants === 5) return "layout-5";
-			if (totalParticipants === 6) return "layout-6";
-			return "layout-7-plus";
+			return Math.max(0, MAX_PARTICIPANTS - totalParticipants);
 		},
 	},
 	watch: {
@@ -81,8 +80,6 @@ const App = Vue.createApp({
 		resetPopups() {
 			this.showChat = false;
 			this.showExtraControls = false;
-			this.showAudioDevices = false;
-			this.showVideoDevices = false;
 		},
 		async toggleMedia(kind) {
 			const enabledKey = kind + "Enabled";
@@ -110,26 +107,6 @@ const App = Vue.createApp({
 				} catch {
 					this.setToast(`Failed to enable ${kind}`);
 				}
-			}
-		},
-		async switchMediaDevice(newDeviceId, kind) {
-			try {
-				const constraints =
-					kind === "audio"
-						? { audio: { deviceId: { exact: newDeviceId } }, video: false }
-						: { audio: false, video: { deviceId: { exact: newDeviceId } } };
-				const newStream = await navigator.mediaDevices.getUserMedia(constraints);
-				const getTracks = kind === "audio" ? "getAudioTracks" : "getVideoTracks";
-				const replaceTrackMethod = kind === "audio" ? "replaceAudioTrack" : "replaceVideoTrack";
-				if (this.localMediaStream) {
-					const oldTrack = this.localMediaStream[getTracks]()[0];
-					if (oldTrack) oldTrack.stop();
-				}
-				const newTrack = newStream[getTracks]()[0];
-				this[replaceTrackMethod](newTrack);
-				this.setToast(`${kind.charAt(0).toUpperCase() + kind.slice(1)} device changed successfully`, "success");
-			} catch {
-				this.setToast(`Failed to switch ${kind} device`);
 			}
 		},
 		replaceMediaTrack(newTrack, kind) {
@@ -338,10 +315,10 @@ const App = Vue.createApp({
 		},
 
 		initiateCall() {
-			if (!this.channelId) return alert("Invalid channel id");
+			if (!this.roomId) return alert("Invalid room id");
 			if (!this.name) return alert("Please enter your name");
 			this.callInitiated = true;
-			this.showExtraControls - false;
+			this.showExtraControls = false;
 			window.initiateCall();
 		},
 		setToast(message, type = "error") {
@@ -353,9 +330,9 @@ const App = Vue.createApp({
 			}, 3500);
 		},
 		copyURL() {
-			navigator.clipboard.writeText(`${window.location.origin}/${this.channelId}`).then(
-				() => this.setToast("Channel URL copied 👍", "success"),
-				() => console.error("Unable to copy channel URL")
+			navigator.clipboard.writeText(`${window.location.origin}/${this.roomId}`).then(
+				() => this.setToast("Room URL copied 👍", "success"),
+				() => console.error("Unable to copy room URL")
 			);
 		},
 		toggleAudio() {
@@ -363,12 +340,6 @@ const App = Vue.createApp({
 		},
 		toggleVideo() {
 			return this.toggleMedia("video");
-		},
-		switchAudioDevice(newDeviceId) {
-			return this.switchMediaDevice(newDeviceId, "audio");
-		},
-		switchVideoDevice(newDeviceId) {
-			return this.switchMediaDevice(newDeviceId, "video");
 		},
 		togglePreCallAudio() {
 			this.audioEnabled = !this.audioEnabled;
@@ -411,8 +382,13 @@ const App = Vue.createApp({
 			// Show toast
 			this.setToast("Call ended", "success");
 
-			// Re-initialize pre-call preview
-			this.getPreCallMedia();
+			// Re-initialize pre-call preview. Returned so callers can toast a
+			// message of their own once the preview has settled.
+			return this.getPreCallMedia();
+		},
+		async handleRoomFull(maxPeers) {
+			await this.endCall();
+			this.setToast(`This room is full. Up to ${maxPeers} people can join a room.`);
 		},
 		stopEvent(e) {
 			e.preventDefault();
@@ -460,10 +436,10 @@ const App = Vue.createApp({
 			if (!this.chatMessage.length) return;
 
 			if (Object.keys(this.peers).length > 0) {
-				this.sendDataMessage("chat", this.chatMessage);
+				this.sendDataMessage("chat", this.chatMessage.slice(0, MAX_CHAT_LENGTH));
 				this.chatMessage = "";
 			} else {
-				alert("No peers in the room");
+				this.setToast("No peers in the room");
 			}
 		},
 		sendDataMessage(key, value) {
@@ -507,15 +483,24 @@ const App = Vue.createApp({
 				this.audioDevices = devices.filter((device) => device.kind === "audioinput");
 				this.videoDevices = devices.filter((device) => device.kind === "videoinput");
 
-				// Set default device ids
-				const defaultAudioDeviceId = this.audioDevices.find((device) => device.deviceId == "default")?.deviceId;
-				const defaultVideoDeviceId = this.videoDevices.find((device) => device.deviceId == "default")?.deviceId;
-
-				this.selectedAudioDeviceId = defaultAudioDeviceId ?? this.audioDevices[0]?.deviceId;
-				this.selectedVideoDeviceId = defaultVideoDeviceId ?? this.videoDevices[0]?.deviceId;
+				this.syncSelectedDevice("audio");
+				this.syncSelectedDevice("video");
 			} catch (error) {
 				console.error("Failed to initialize media devices:", error);
 			}
+		},
+		syncSelectedDevice(kind) {
+			// Point the select at whatever the live stream is actually using, so it
+			// opens on the device the browser picked by default.
+			const devices = kind === "audio" ? this.audioDevices : this.videoDevices;
+			const selectedKey = kind === "audio" ? "selectedAudioDeviceId" : "selectedVideoDeviceId";
+			const getTracks = kind === "audio" ? "getAudioTracks" : "getVideoTracks";
+
+			const activeDeviceId = this.localMediaStream?.[getTracks]()[0]?.getSettings?.().deviceId;
+			const isKnown = (deviceId) => deviceId && devices.some((device) => device.deviceId === deviceId);
+
+			if (isKnown(activeDeviceId)) this[selectedKey] = activeDeviceId;
+			else if (!isKnown(this[selectedKey])) this[selectedKey] = devices[0]?.deviceId ?? null;
 		},
 		getBlankTrack(kind) {
 			if (kind === "video") {
@@ -563,10 +548,9 @@ const App = Vue.createApp({
 					videoElem.srcObject = this.localMediaStream;
 				}
 
-				// Enumerate devices once during pre-call flow if not already done
-				if (this.audioDevices.length === 0 && this.videoDevices.length === 0) {
-					await this.enumerateDevices();
-				}
+				// Labels are only exposed once permission is granted, so re-read the
+				// device list on every attempt.
+				await this.enumerateDevices();
 			} catch {
 				// If user denies access, create blank tracks as needed
 				this.audioEnabled = false;
@@ -577,20 +561,8 @@ const App = Vue.createApp({
 				if (videoElem) {
 					videoElem.srcObject = this.localMediaStream;
 				}
+				await this.enumerateDevices();
 				this.setToast("Unable to access camera/mic");
-			}
-		},
-		requestFullscreen(videoElem) {
-			if (!videoElem) return;
-			const el = Array.isArray(videoElem) ? videoElem[0] : videoElem;
-			if (el.requestFullscreen) {
-				el.requestFullscreen();
-			} else if (el.webkitRequestFullscreen) {
-				el.webkitRequestFullscreen();
-			} else if (el.mozRequestFullScreen) {
-				el.mozRequestFullScreen();
-			} else if (el.msRequestFullscreen) {
-				el.msRequestFullscreen();
 			}
 		},
 	},
@@ -601,7 +573,9 @@ const App = Vue.createApp({
 	},
 }).mount("#app");
 
-// Register service worker for PWA functionality
+// Unregister any previously installed service worker (caching removed)
 if ("serviceWorker" in navigator) {
-	navigator.serviceWorker.register("/sw.js");
+	navigator.serviceWorker.getRegistrations().then((registrations) => {
+		registrations.forEach((registration) => registration.unregister());
+	});
 }
